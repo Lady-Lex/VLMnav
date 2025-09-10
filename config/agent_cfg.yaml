@@ -1,0 +1,55 @@
+
+task: GOAT
+agent_cls: GOATAgent
+
+
+agent_cfg:
+  navigability_mode: 'depth_sensor' # 可选: none | depth_estimate | segmentation | depth_sensor
+  project: true
+  pivot: false
+  context_history: 0
+  explore_bias: 4
+  max_action_dist: 1.7
+  min_action_dist: 0.5
+  clip_frac: 0.66
+  stopping_action_dist: 1.5
+  default_action: 0.2
+  spacing_ratio: 360
+  num_theta: 60
+  image_edge_threshold: 0.04
+  turn_around_cooldown: 10
+  navigability_height_threshold: 0.2
+  map_scale: 100
+  vlm_cfg:
+    model_cls: GeminiVLM
+    model_kwargs:
+      model: gemini-1.5-flash
+  agent_height: 0.5
+  agent_radius: 0.17
+  allow_slide: true
+  use_goal_image_agent: true
+  goal_image_agent_fov: 131
+  sensor_cfg:
+    height: 0.5
+    res_factor: 1
+    fov: 131
+    pitch: 0.0
+
+sim_cfg:
+  agent_height: 0.5
+  agent_radius: 0.17
+  allow_slide: true
+  use_goal_image_agent: true
+  goal_image_agent_fov: 131
+  sensor_cfg:
+    height: 0.5
+    res_factor: 1
+    fov: 131
+    pitch: 0.0
+
+
+# —— 初始语言目标（也可运行时用话题覆盖）——
+goal:
+  mode: description
+  name: "Pallet jack"
+  lang_desc: "You are a delivery robot in a warehouse. Deliver the goods to the pallet jack. Treat all traffic cones as obstacles and do not enter the yellow striped restricted zones at any time."

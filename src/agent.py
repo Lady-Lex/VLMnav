@@ -58,6 +58,8 @@ class VLMNavAgent(Agent):
     e_i_scaling = 0.8
 
     def __init__(self, cfg: dict):
+
+        self._win_init = False
         self.cfg = cfg
         self.fov = cfg['sensor_cfg']['fov']
         self.resolution = (
@@ -74,13 +76,18 @@ class VLMNavAgent(Agent):
         self.depth_estimator = DepthEstimator() if cfg['navigability_mode'] == 'depth_estimate' else None
         self.segmentor = Segmentor() if cfg['navigability_mode'] == 'segmentation' else None
         self.reset()
+        
+    
+
 
     def step(self, obs: dict):
+        
         agent_state: habitat_sim.AgentState = obs['agent_state']
         if self.step_ndx == 0:
             self.init_pos = agent_state.position
 
         agent_action, metadata = self._choose_action(obs)
+        
         metadata['step_metadata'].update(self.cfg)
 
         if metadata['step_metadata']['action_number'] == 0:
@@ -96,6 +103,46 @@ class VLMNavAgent(Agent):
         metadata['images']['color_sensor_chosen'] = chosen_action_image
 
         self.step_ndx += 1
+        # ===== 主线程里可视化（非阻塞）=====111
+        if self.cfg.get('viz', True):
+            # 懒加载窗口，只建一次
+            if not self._win_init:
+                cv2.namedWindow("Color Sensor", cv2.WINDOW_NORMAL)
+                cv2.namedWindow("Voxel Map", cv2.WINDOW_NORMAL)
+                self._win_init = True
+
+            color_img = metadata['images'].get('color_sensor_chosen', metadata['images']['color_sensor_chosen'])
+            voxel_img = metadata['images'].get('voxel_map', None)
+
+            # 规范化/兜底
+            if voxel_img is not None:
+                if voxel_img.size == 0:
+                    voxel_img = np.zeros((100, 100), dtype=np.uint8)  # 避免空图崩溃
+                if voxel_img.dtype != np.uint8:
+                    vmin, vmax = float(voxel_img.min()), float(voxel_img.max())
+                    if vmax - vmin < 1e-8:
+                        voxel_img = np.zeros_like(voxel_img, dtype=np.uint8)
+                    else:
+                        voxel_img = ((voxel_img - vmin) / (vmax - vmin) * 255.0).astype(np.uint8)
+                if voxel_img.ndim == 2:
+                    pass  # 灰度OK
+                elif voxel_img.ndim == 3 and voxel_img.shape[2] in (1, 3):
+                    pass  # 单通道或BGR OK
+                else:
+                    # 体素3D体 or 形状不对：取一层/最大投影
+                    voxel_img = np.max(voxel_img, axis=-1).astype(np.uint8) if voxel_img.ndim == 3 else voxel_img
+
+                cv2.imshow("Voxel Map", voxel_img)
+
+            cv2.imshow("Color Sensor", color_img)
+            # 非阻塞，给GUI一点事件时间
+            key = cv2.waitKey(1) & 0xFF
+            # 可选：按 'q' 关闭窗口
+            if key == ord('q'):
+                cv2.destroyAllWindows()
+                self._win_init = False
+        # ===== 可视化到此 =====111
+        
         return agent_action, metadata
     
     def get_spend(self):
@@ -185,6 +232,7 @@ class VLMNavAgent(Agent):
 
         a_final_projected = self._projection(a_final, images, agent_state)
         images['voxel_map'] = self._generate_voxel(a_final_projected, agent_state=agent_state)
+        
         return a_final_projected, images
 
     def _stopping_module(self, stopping_images: list[np.array], goal):
@@ -359,6 +407,7 @@ class VLMNavAgent(Agent):
         logging_data = {}
         try:
             response_dict = self._eval_response(response)
+            print(response_dict)#111
             step_metadata['action_number'] = int(response_dict['action'])
         except (IndexError, KeyError, TypeError, ValueError) as e:
             logging.error(f'Error parsing response {e}')
@@ -672,6 +721,7 @@ class GOATAgent(VLMNavAgent):
         a_final, images, step_metadata, stopping_response = self._run_threads(obs, stopping_images, goal)
         if goal['mode'] == 'image':
             images['goal_image'] = goal['goal_image']
+            
 
         step_metadata.update({
             'goal': goal['name'],
@@ -818,3 +868,5 @@ class ObjectNavAgent(VLMNavAgent):
             return action_prompt
 
         raise ValueError('Prompt type must be stopping, pivot, no_project, or action')
+
+
