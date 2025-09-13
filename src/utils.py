@@ -81,7 +81,7 @@ def local_to_image(local_point, resolution, focal_length):
     Returns:
         tuple: The pixel coordinates (x_pixel, y_pixel).
     """
-    point_3d = [local_point[0], -local_point[1], -local_point[2]]  # Inconsistency between Habitat camera frame and classical convention
+    point_3d = [local_point[0], local_point[1], local_point[2]]  # ROS camera frame: X=right, Y=down, Z=forward
     if point_3d[2] == 0:
         point_3d[2] = 0.0001
     x = focal_length * point_3d[0] / point_3d[2]
@@ -108,7 +108,7 @@ def unproject_2d(x_pixel, y_pixel, depth, resolution, focal_length):
     """
     x = (x_pixel - resolution[1] / 2) * depth / focal_length
     y = (y_pixel - resolution[0] / 2) * depth / focal_length
-    return x, -y, -depth
+    return x, y, depth  # ROS camera frame: X=right, Y=down, Z=forward
 
 
 def agent_frame_to_image_coords(point, agent_state, sensor_state, resolution, focal_length):
@@ -127,7 +127,7 @@ def agent_frame_to_image_coords(point, agent_state, sensor_state, resolution, fo
     """
     global_p = local_to_global(agent_state.position, agent_state.rotation, point)
     camera_pt = global_to_local(sensor_state.position, sensor_state.rotation, global_p)
-    if camera_pt[2] > 0:
+    if camera_pt[2] < 0:
         return None
     return local_to_image(camera_pt, resolution, focal_length)
 
@@ -257,15 +257,13 @@ def depth_to_height(depth_image, hfov, camera_position, camera_orientation):
     i_idx, j_idx = np.indices((img_height, img_width))
     x_prime = (j_idx - img_width / 2)
     y_prime = (i_idx - img_height / 2)
-
     x_local = x_prime * depth_image / focal_length_px
     y_local = y_prime * depth_image / focal_length_px
     z_local = depth_image
-
-    local_points = np.stack((x_local, -y_local, -z_local), axis=-1)
+    local_points = np.stack((x_local, y_local, z_local), axis=-1)  # ROS camera frame: X=right, Y=down, Z=forward
     global_points = local_to_global(camera_position, camera_orientation, local_points)
 
-    return global_points[:, :, 1]  # Return height map
+    return global_points[:, :, 2]  # Return height map (Z coordinate in ROS)
 
 def log_exception(e):
     """Logs an exception with traceback information."""

@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 import random
 import habitat_sim
 import numpy as np
@@ -52,7 +53,7 @@ class VLMNavAgent(Agent):
     """
     explored_color = GREY
     unexplored_color = GREEN
-    map_size = 5000
+    map_size = 10000
     explore_threshold = 3
     voxel_ray_size = 60
     e_i_scaling = 0.8
@@ -63,8 +64,10 @@ class VLMNavAgent(Agent):
         self.cfg = cfg
         self.fov = cfg['sensor_cfg']['fov']
         self.resolution = (
-            1080 // cfg['sensor_cfg']['res_factor'],
-            1920 // cfg['sensor_cfg']['res_factor']
+            # 1080 // cfg['sensor_cfg']['res_factor'],
+            # 1920 // cfg['sensor_cfg']['res_factor']
+            480 // cfg['sensor_cfg']['res_factor'],
+            640 // cfg['sensor_cfg']['res_factor']
         )
 
         self.focal_length = calculate_focal_length(self.fov, self.resolution[1])
@@ -81,7 +84,6 @@ class VLMNavAgent(Agent):
 
 
     def step(self, obs: dict):
-        
         agent_state: habitat_sim.AgentState = obs['agent_state']
         if self.step_ndx == 0:
             self.init_pos = agent_state.position
@@ -103,9 +105,9 @@ class VLMNavAgent(Agent):
         metadata['images']['color_sensor_chosen'] = chosen_action_image
 
         self.step_ndx += 1
-        # ===== 主线程里可视化（非阻塞）=====111
+        # ===== Visualization in main thread (non-blocking) =====
         if self.cfg.get('viz', True):
-            # 懒加载窗口，只建一次
+            # Lazy load windows, create only once
             if not self._win_init:
                 cv2.namedWindow("Color Sensor", cv2.WINDOW_NORMAL)
                 cv2.namedWindow("Voxel Map", cv2.WINDOW_NORMAL)
@@ -114,10 +116,10 @@ class VLMNavAgent(Agent):
             color_img = metadata['images'].get('color_sensor_chosen', metadata['images']['color_sensor_chosen'])
             voxel_img = metadata['images'].get('voxel_map', None)
 
-            # 规范化/兜底
+            # Normalize/fallback
             if voxel_img is not None:
                 if voxel_img.size == 0:
-                    voxel_img = np.zeros((100, 100), dtype=np.uint8)  # 避免空图崩溃
+                    voxel_img = np.zeros((100, 100), dtype=np.uint8)  # Avoid empty image crash
                 if voxel_img.dtype != np.uint8:
                     vmin, vmax = float(voxel_img.min()), float(voxel_img.max())
                     if vmax - vmin < 1e-8:
@@ -125,23 +127,23 @@ class VLMNavAgent(Agent):
                     else:
                         voxel_img = ((voxel_img - vmin) / (vmax - vmin) * 255.0).astype(np.uint8)
                 if voxel_img.ndim == 2:
-                    pass  # 灰度OK
+                    pass  # Grayscale OK
                 elif voxel_img.ndim == 3 and voxel_img.shape[2] in (1, 3):
-                    pass  # 单通道或BGR OK
+                    pass  # Single channel or BGR OK
                 else:
-                    # 体素3D体 or 形状不对：取一层/最大投影
+                    # 3D voxel or wrong shape: take one layer/max projection
                     voxel_img = np.max(voxel_img, axis=-1).astype(np.uint8) if voxel_img.ndim == 3 else voxel_img
 
                 cv2.imshow("Voxel Map", voxel_img)
 
             cv2.imshow("Color Sensor", color_img)
-            # 非阻塞，给GUI一点事件时间
+            # Non-blocking, give GUI some event time
             key = cv2.waitKey(1) & 0xFF
-            # 可选：按 'q' 关闭窗口
+            # Optional: press 'q' to close window
             if key == ord('q'):
                 cv2.destroyAllWindows()
                 self._win_init = False
-        # ===== 可视化到此 =====111
+        # ===== Visualization ends here =====
         
         return agent_action, metadata
     
@@ -175,6 +177,11 @@ class VLMNavAgent(Agent):
 
     def _run_threads(self, obs: dict, stopping_images: list[np.array], goal):
         """Concurrently runs the stopping thread to determine if the agent should stop, and the preprocessing thread to calculate potential actions."""
+        # Save current agent state and depth image for distance checking
+        self._current_agent_state = obs['agent_state']
+        if 'depth_sensor' in obs:
+            self._current_depth_image = obs['depth_sensor']
+        
         with concurrent.futures.ThreadPoolExecutor() as executor:
             preprocessing_thread = executor.submit(self._preprocessing_module, obs)
             stopping_thread = executor.submit(self._stopping_module, stopping_images, goal)
@@ -240,10 +247,71 @@ class VLMNavAgent(Agent):
         stopping_prompt = self._construct_prompt(goal, 'stopping')
         stopping_response = self.stoppingVLM.call(stopping_images, stopping_prompt)
         dct = self._eval_response(stopping_response)
+        
+        # Stricter termination conditions: VLM determines completion + distance check
         if 'done' in dct and int(dct['done']) == 1:
-            return True, stopping_response
+            # Add distance threshold check to ensure truly close to target
+            if hasattr(self, '_check_distance_threshold'):
+                distance_ok = self._check_distance_threshold(goal)
+                if distance_ok:
+                    return True, stopping_response
+                else:
+                    logging.info(f'VLM called stop but distance threshold not met, continuing...')
+                    return False, stopping_response
+            else:
+                # If no distance check method, use more conservative consecutive stop requirement
+                return True, stopping_response
         
         return False, stopping_response
+
+    def _check_distance_threshold(self, goal):
+        """
+        Check if truly close to target object.
+        Perform stricter termination condition check based on depth image and step count.
+        Use threshold parameters from configuration file.
+        """
+        # Get current agent position
+        if not hasattr(self, '_current_agent_state'):
+            return False
+            
+        # Get threshold parameters from configuration
+        min_steps = self.cfg.get('min_steps_before_terminate', 15)
+        min_consecutive_stops = self.cfg.get('min_consecutive_stops', 3)
+        max_avg_distance = self.cfg.get('max_avg_distance', 1.5)
+        max_min_distance = self.cfg.get('max_min_distance', 1.0)
+        
+        # Conservative check based on step count
+        if self.step_ndx < min_steps:
+            logging.info(f"Too early to terminate (step {self.step_ndx} < {min_steps}), continuing...")
+            return False
+        
+        # Check if stop has been called consecutively multiple times
+        if len(self.stopping_calls) < min_consecutive_stops:
+            logging.info(f"Not enough stopping calls ({len(self.stopping_calls)} < {min_consecutive_stops}), continuing...")
+            return False
+            
+        # Check if recent stop calls are consecutive
+        recent_calls = self.stopping_calls[-min_consecutive_stops:]
+        if not all(recent_calls[i] == recent_calls[i-1] + 1 for i in range(1, len(recent_calls))):
+            logging.info("Stopping calls not consecutive enough, continuing...")
+            return False
+        
+        # Distance check based on depth image (if available)
+        if hasattr(self, '_current_depth_image'):
+            depth_image = self._current_depth_image
+            # Calculate average distance of valid pixels in depth image
+            valid_depths = depth_image[depth_image > 0]
+            if len(valid_depths) > 0:
+                avg_distance = np.mean(valid_depths)
+                min_distance = np.min(valid_depths)
+                
+                # Use configured threshold to check distance
+                if avg_distance > max_avg_distance or min_distance > max_min_distance:
+                    logging.info(f"Distance too far (avg: {avg_distance:.2f} > {max_avg_distance}, min: {min_distance:.2f} > {max_min_distance}), continuing...")
+                    return False
+        
+        logging.info("Distance threshold met, allowing termination")
+        return True
 
     def _navigability(self, obs: dict):
         """Generates the set of navigability actions and updates the voxel map accordingly."""
@@ -260,24 +328,87 @@ class VLMNavAgent(Agent):
             rgb_image, depth_image, agent_state, sensor_state
         )
 
+        # # 保存navigability_mask图片
+        # if navigability_mask is not None and navigability_mask.size > 0:
+        #     mask_image = (navigability_mask * 255).astype(np.uint8)
+        #     cv2.imwrite(f"runs/navigability_mask_step_{self.step_ndx}.png", mask_image)
+        #     print(f"Saved navigability_mask to navigability_mask_step_{self.step_ndx}.png")
+        # else:
+        #     print("Warning: navigability_mask is empty or None")
+        
+        
         sensor_range =  np.deg2rad(self.fov / 2) * 1.5
 
         all_thetas = np.linspace(-sensor_range, sensor_range, self.cfg['num_theta'])
         start = agent_frame_to_image_coords(
-            [0, 0, 0], agent_state, sensor_state,
+            [2, 0, 0], agent_state, sensor_state,
             resolution=self.resolution, focal_length=self.focal_length
         )
-
+        
         a_initial = []
         for theta_i in all_thetas:
-            r_i, theta_i = self._get_radial_distance(start, theta_i, navigability_mask, agent_state, sensor_state, depth_image)
+            r_i, theta_i, coords_in_base = self._get_radial_distance(start, theta_i, navigability_mask, agent_state, sensor_state, depth_image)
             if r_i is not None:
                 self._update_voxel(
                     r_i, theta_i, agent_state,
                     clip_dist=self.cfg['max_action_dist'], clip_frac=self.e_i_scaling
                 )
-                a_initial.append((r_i, theta_i))
-
+                a_initial.append((r_i, theta_i, coords_in_base))
+        
+        # # 可视化a_initial
+        # if a_initial:
+        #     # 创建可视化图像
+        #     vis_image = np.zeros((self.resolution[0], self.resolution[1], 3), dtype=np.uint8)
+            
+        #     # 绘制navigability_mask作为背景
+        #     vis_image[:, :, 0] = navigability_mask * 100  # 红色通道：可导航区域
+        #     vis_image[:, :, 1] = navigability_mask * 100  # 绿色通道：可导航区域
+        #     vis_image[:, :, 2] = navigability_mask * 100  # 蓝色通道：可导航区域
+            
+        #     # 绘制起始点
+        #     cv2.circle(vis_image, (int(start[0]), int(start[1])), 8, (0, 255, 0), -1)  # 绿色：起始点
+            
+        #     # 绘制每个a_initial动作
+        #     for i, (r_i, theta_i, coords_in_base) in enumerate(a_initial):
+        #         if r_i is not None and r_i > 0 and coords_in_base is not None:
+        #             # 确保coords_in_base是有效的3D向量
+        #             if isinstance(coords_in_base, np.ndarray) and coords_in_base.shape == (3,):
+        #                 # 计算动作终点在图像中的位置
+        #                 action_pxl = agent_frame_to_image_coords(
+        #                     coords_in_base, agent_state, sensor_state,
+        #                     resolution=self.resolution, focal_length=self.focal_length
+        #                 )
+        #             else:
+        #                 print(f"Warning: coords_in_base is not a valid 3D vector: {coords_in_base}")
+        #                 continue
+                    
+        #             if action_pxl is not None:
+        #                 # 绘制动作箭头
+        #                 end_x, end_y = int(action_pxl[0]), int(action_pxl[1])
+        #                 start_x, start_y = int(start[0]), int(start[1])
+                        
+        #                 # 确保坐标在图像范围内
+        #                 if (0 <= end_x < self.resolution[1] and 0 <= end_y < self.resolution[0]):
+        #                     # 绘制箭头
+        #                     cv2.arrowedLine(vis_image, (start_x, start_y), (end_x, end_y), 
+        #                                   (0, 0, 255), 2, tipLength=0.1)  # 红色箭头
+                            
+        #                     # 绘制距离标签
+        #                     label = f"{r_i:.2f}m"
+        #                     cv2.putText(vis_image, label, (end_x + 5, end_y - 5), 
+        #                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                            
+        #                     # 绘制角度标签
+        #                     angle_deg = theta_i * 180 / np.pi
+        #                     angle_label = f"{angle_deg:.1f} degree"
+        #                     cv2.putText(vis_image, angle_label, (end_x + 5, end_y + 15), 
+        #                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+            
+        #     # 保存可视化图像
+        #     cv2.imwrite(f"runs/a_initial_step_{self.step_ndx}.png", vis_image)
+        #     print(f"Saved a_initial visualization to runs/a_initial_step_{self.step_ndx}.png")
+        #     print(f"Total actions: {len(a_initial)}")
+        
         return a_initial
 
     def _action_proposer(self, a_initial: list, agent_state: habitat_sim.AgentState):
@@ -289,7 +420,7 @@ class VLMNavAgent(Agent):
 
         explore = explore_bias > 0
         unique = {}
-        for mag, theta in a_initial:
+        for mag, theta, coords_in_base in a_initial:
             if theta in unique:
                 unique[theta].append(mag)
             else:
@@ -302,7 +433,7 @@ class VLMNavAgent(Agent):
         for theta, mags in unique.items():
             # Reference the map to classify actions as explored or unexplored
             mag = min(mags)
-            cart = [self.e_i_scaling*mag*np.sin(theta), 0, -self.e_i_scaling*mag*np.cos(theta)]
+            cart = [self.e_i_scaling*mag*np.cos(theta), self.e_i_scaling*mag*np.sin(theta), 0]
             global_coords = local_to_global(agent_state.position, agent_state.rotation, cart)
             grid_coords = self._global_to_grid(global_coords)
             score = (sum(np.all((topdown_map[grid_coords[1]-2:grid_coords[1]+2, grid_coords[0]] == self.explored_color), axis=-1)) + 
@@ -368,7 +499,24 @@ class VLMNavAgent(Agent):
             return self._get_default_arrows()
         
         out.sort(key=lambda x: x[1])
-        return [(mag, theta) for mag, theta, _ in out]
+        a_final = [(mag, theta) for mag, theta, _ in out]
+        
+        # # 可视化a_final - 使用真正的俯视图
+        # if a_final:
+        #     # 创建动作字典用于_generate_voxel函数
+        #     a_final_dict = {}
+        #     for i, (mag, theta) in enumerate(a_final):
+        #         a_final_dict[(mag, theta)] = i + 1  # 动作编号从1开始
+            
+        #     # 使用_generate_voxel函数创建真正的俯视图
+        #     topdown_image = self._generate_voxel(a_final_dict, agent_state=agent_state)
+            
+        #     # 保存俯视图可视化图像
+        #     cv2.imwrite(f"runs/a_final_topdown_step_{self.step_ndx}.png", topdown_image)
+        #     print(f"Saved a_final top-down visualization to runs/a_final_topdown_step_{self.step_ndx}.png")
+        #     print(f"Total final actions: {len(a_final)}")
+        
+        return a_final
 
     def _projection(self, a_final: list, images: dict, agent_state: habitat_sim.AgentState):
         """
@@ -379,7 +527,7 @@ class VLMNavAgent(Agent):
             a_final, images['color_sensor'], agent_state,
             agent_state.sensor_states['color_sensor']
         )
-
+        
         if not a_final_projected and (self.step_ndx - self.turned < self.cfg['turn_around_cooldown']):
             logging.info('No actions projected and cannot turn around')
             a_final = self._get_default_arrows()
@@ -428,7 +576,23 @@ class VLMNavAgent(Agent):
         else:
             thresh = 1 if self.cfg['navigability_mode'] == 'depth_estimate' else self.cfg['navigability_height_threshold']
             height_map = depth_to_height(depth_image, self.fov, sensor_state.position, sensor_state.rotation)
-            navigability_mask = abs(height_map - (agent_state.position[1] - 0.04)) < thresh
+            
+            # # 可视化height_map
+            # if height_map is not None and height_map.size > 0:
+            #     # 归一化到0-255范围用于显示
+            #     height_min = height_map.min()
+            #     height_max = height_map.max()
+            #     if height_max > height_min:
+            #         height_normalized = ((height_map - height_min) / (height_max - height_min) * 255).astype(np.uint8)
+            #     else:
+            #         height_normalized = np.zeros_like(height_map, dtype=np.uint8)
+                
+            #     cv2.imwrite(f"runs/height_map_step_{self.step_ndx}.png", height_normalized)
+            #     print(f"Saved height_map to height_map_step_{self.step_ndx}.png (range: {height_min:.3f} to {height_max:.3f})")
+            # else:
+            #     print("Warning: height_map is empty or None")
+            
+            navigability_mask = abs(height_map - (agent_state.position[2] - 0.09)) < thresh
 
         return navigability_mask
 
@@ -454,21 +618,55 @@ class VLMNavAgent(Agent):
         """
         Calculates the distance r_i that the agent can move in the direction theta_i, according to the navigability mask.
         """
-        agent_point = [2 * np.sin(theta_i), 0, -2 * np.cos(theta_i)]
+        # Correct coordinate system: ROS base_link is forward X, left Y, up Z
+        agent_point = [3 * np.cos(theta_i), 3 * np.sin(theta_i), 0]
+        
         end_pxl = agent_frame_to_image_coords(
             agent_point, agent_state, sensor_state, 
             resolution=self.resolution, focal_length=self.focal_length
         )
-        if end_pxl is None or end_pxl[1] >= self.resolution[0]:
-            return None, None
+        
+        # print(f"  end_pxl: {end_pxl}")
+        
+        # if end_pxl is None:
+        #     print(f"  ERROR: end_pxl is None for theta_i={theta_i}")
+        #     return None, None
+        # if end_pxl[1] >= self.resolution[1]:
+        #     print(f"  ERROR: end_pxl[1]={end_pxl[1]} >= resolution[1]={self.resolution[1]}")
+        #     return None, None
 
         H, W = navigability_mask.shape
 
         # Find intersections of the theoretical line with the image boundaries
         intersections = find_intersections(start_pxl[0], start_pxl[1], end_pxl[0], end_pxl[1], W, H)
         if intersections is None:
-            return None, None
-
+            return None, None, None
+        
+        # # 保存标注了intersections的mask图片
+        # if intersections is not None:
+        #     # 创建彩色图像用于可视化
+        #     mask_vis = np.zeros((H, W, 3), dtype=np.uint8)
+        #     # 将navigability_mask转换为彩色
+        #     mask_vis[:, :, 0] = navigability_mask * 255  # 红色通道：可导航区域
+        #     mask_vis[:, :, 1] = navigability_mask * 255  # 绿色通道：可导航区域
+        #     mask_vis[:, :, 2] = navigability_mask * 255  # 蓝色通道：可导航区域
+            
+        #     # 标注起始点和结束点
+        #     cv2.circle(mask_vis, (int(start_pxl[0]), int(start_pxl[1])), 5, (0, 255, 0), -1)  # 绿色：起始点
+        #     cv2.circle(mask_vis, (int(end_pxl[0]), int(end_pxl[1])), 5, (255, 0, 0), -1)    # 蓝色：结束点
+            
+        #     # 标注交点
+        #     (x1, y1), (x2, y2) = intersections
+        #     cv2.circle(mask_vis, (int(x1), int(y1)), 8, (0, 0, 255), -1)  # 红色：交点1
+        #     cv2.circle(mask_vis, (int(x2), int(y2)), 8, (0, 0, 255), -1)  # 红色：交点2
+            
+        #     # 画射线
+        #     cv2.line(mask_vis, (int(start_pxl[0]), int(start_pxl[1])), (int(end_pxl[0]), int(end_pxl[1])), (255, 255, 0), 2)  # 黄色：射线
+            
+        #     # 保存图片
+        #     cv2.imwrite(f"runs/intersections_step_{self.step_ndx}_theta_{theta_i*180/np.pi:.1f}.png", mask_vis)
+        #     print(f"  Saved intersections visualization for theta_i={theta_i*180/np.pi:.1f}°")
+        
         (x1, y1), (x2, y2) = intersections
         num_points = max(abs(x2 - x1), abs(y2 - y1)) + 1
         x_coords = np.linspace(x1, x2, num_points)
@@ -476,7 +674,7 @@ class VLMNavAgent(Agent):
 
         out = (int(x_coords[-1]), int(y_coords[-1]))
         if not navigability_mask[int(y_coords[0]), int(x_coords[0])]:
-            return 0, theta_i
+            return 0, theta_i, [0, 0, 0]
 
         for i in range(num_points - 4):
             # Trace pixels until they are not navigable
@@ -485,16 +683,47 @@ class VLMNavAgent(Agent):
             if sum([navigability_mask[int(y_coords[j]), int(x_coords[j])] for j in range(i, i + 4)]) <= 2:
                 out = (x, y)
                 break
-
+        
+        # # 保存out可视化图片
+        # if i < num_points - 4:  # 如果找到了障碍物
+        #     # 创建可视化图像
+        #     vis_image = np.zeros((H, W, 3), dtype=np.uint8)
+        #     # 绘制navigability_mask作为背景
+        #     vis_image[:, :, 0] = navigability_mask * 100  # 红色通道
+        #     vis_image[:, :, 1] = navigability_mask * 100  # 绿色通道
+        #     vis_image[:, :, 2] = navigability_mask * 100  # 蓝色通道
+            
+        #     # 绘制起始点
+        #     cv2.circle(vis_image, (int(start_pxl[0]), int(start_pxl[1])), 5, (0, 255, 0), -1)  # 绿色
+            
+        #     # 绘制射线路径（前i个像素）
+        #     for j in range(i + 1):
+        #         px = int(x_coords[j])
+        #         py = int(y_coords[j])
+        #         if 0 <= px < W and 0 <= py < H:
+        #             cv2.circle(vis_image, (px, py), 1, (255, 255, 0), -1)  # 黄色：可导航路径
+            
+        #     # 绘制障碍物位置
+        #     cv2.circle(vis_image, (int(out[0]), int(out[1])), 8, (0, 0, 255), -1)  # 红色：障碍物
+            
+        #     # 绘制射线
+        #     cv2.line(vis_image, (int(start_pxl[0]), int(start_pxl[1])), (int(out[0]), int(out[1])), (255, 0, 255), 2)  # 紫色：射线
+            
+        #     # 保存图片
+        #     cv2.imwrite(f"runs/out_step_{self.step_ndx}_theta_{theta_i*180/np.pi:.1f}.png", vis_image)
+        #     print(f"    Saved out visualization for theta_i={theta_i*180/np.pi:.1f}°")
+        
         if i < 5:
-            return 0, theta_i
+            return 0, theta_i, [0, 0, 0]
 
         if self.cfg['navigability_mode'] == 'segmentation':
-            #Simple estimation of distance based on number of pixels
+            # Simple estimation of distance based on number of pixels
             r_i = 0.0794 * np.exp(0.006590 * i) + 0.616
+            # For segmentation mode, create a local_coords based on polar coordinates
+            local_coords = np.array([r_i * np.cos(theta_i), r_i * np.sin(theta_i), 0])
 
         else:
-            #use depth to get distance
+            # Use depth to get distance
             out = (np.clip(out[0], 0, W - 1), np.clip(out[1], 0, H - 1))
             camera_coords = unproject_2d(
                 *out, depth_image[out[1], out[0]], resolution=self.resolution, focal_length=self.focal_length
@@ -503,25 +732,26 @@ class VLMNavAgent(Agent):
                 agent_state.position, agent_state.rotation,
                 local_to_global(sensor_state.position, sensor_state.rotation, camera_coords)
             )
-            r_i = np.linalg.norm([local_coords[0], local_coords[2]])
-
-        return r_i, theta_i
+            r_i = np.linalg.norm([local_coords[0], local_coords[1]])
+            
+        return r_i, theta_i, local_coords
 
     def _can_project(self, r_i: float, theta_i: float, agent_state: habitat_sim.AgentState, sensor_state: habitat_sim.SixDOFPose):
         """
         Checks whether the specified polar action can be projected onto the image, i.e., not too close to the boundaries of the image.
         """
-        agent_point = [r_i * np.sin(theta_i), 0, -r_i * np.cos(theta_i)]
+        agent_point = [r_i * np.cos(theta_i), r_i * np.sin(theta_i), 0.0]
         end_px = agent_frame_to_image_coords(
             agent_point, agent_state, sensor_state, 
             resolution=self.resolution, focal_length=self.focal_length
         )
+        
         if end_px is None:
             return None
-
+        
         if (
-            self.cfg['image_edge_threshold'] * self.resolution[1] <= end_px[0] <= (1 - self.cfg['image_edge_threshold']) * self.resolution[1] and
-            self.cfg['image_edge_threshold'] * self.resolution[0] <= end_px[1] <= (1 - self.cfg['image_edge_threshold']) * self.resolution[0]
+            self.cfg['image_edge_threshold'] * self.resolution[0] <= end_px[0] <= (1 - self.cfg['image_edge_threshold']) * self.resolution[0] and
+            self.cfg['image_edge_threshold'] * self.resolution[1] <= end_px[1] <= (1 - self.cfg['image_edge_threshold']) * self.resolution[1]
         ):
             return end_px
         return None
@@ -543,14 +773,16 @@ class VLMNavAgent(Agent):
             return projected
 
         start_px = agent_frame_to_image_coords(
-            [0, 0, 0], agent_state, sensor_state, 
+            [2, 0, 0], agent_state, sensor_state, 
             resolution=self.resolution, focal_length=self.focal_length
         )
         for _, (r_i, theta_i) in enumerate(a_final):
+            # print(f"    _project_onto_image: r_i={r_i}, theta_i={theta_i*180/np.pi:.1f}°")
             text_size = 2.4 * scale_factor
             text_thickness = math.ceil(3 * scale_factor)
 
             end_px = self._can_project(r_i, theta_i, agent_state, sensor_state)
+            # print(f"    _project_onto_image: end_px={end_px}")
             if end_px is not None:
                 action_name = len(projected) + 1
                 projected[(r_i, theta_i)] = action_name
@@ -595,25 +827,28 @@ class VLMNavAgent(Agent):
 
         # Mark unexplored regions
         unclipped = max(r - 0.5, 0)
-        local_coords = np.array([unclipped * np.sin(theta), 0, -unclipped * np.cos(theta)])
+        local_coords = np.array([unclipped * np.cos(theta), unclipped * np.sin(theta), 0])
         global_coords = local_to_global(agent_state.position, agent_state.rotation, local_coords)
         point = self._global_to_grid(global_coords)
         cv2.line(self.voxel_map, agent_coords, point, self.unexplored_color, self.voxel_ray_size)
 
         # Mark explored regions
         clipped = min(clip_frac * r, clip_dist)
-        local_coords = np.array([clipped * np.sin(theta), 0, -clipped * np.cos(theta)])
+        local_coords = np.array([clipped * np.cos(theta), clipped * np.sin(theta), 0])
         global_coords = local_to_global(agent_state.position, agent_state.rotation, local_coords)
         point = self._global_to_grid(global_coords)
         cv2.line(self.explored_map, agent_coords, point, self.explored_color, self.voxel_ray_size)
 
     def _global_to_grid(self, position: np.ndarray, rotation=None):
-        """Convert global coordinates to grid coordinates in the agent's voxel map"""
-        dx = position[0] - self.init_pos[0]
-        dz = position[2] - self.init_pos[2]
+        """Convert global coordinates to grid coordinates in the agent's voxel map
+        ROS base frame: forward X, left Y, up Z
+        For top-down view: X->image_x, Y->image_y (note Y-axis needs to be flipped)
+        """
+        dx = position[0] - self.init_pos[0]  # X-axis: forward direction -> image X direction
+        dy = position[1] - self.init_pos[1]  # Y-axis: left direction -> image Y direction (needs flipping)
         resolution = self.voxel_map.shape
         x = int(resolution[1] // 2 + dx * self.scale)
-        y = int(resolution[0] // 2 + dz * self.scale)
+        y = int(resolution[0] // 2 - dy * self.scale)  # Flip Y-axis because image Y-axis points downward
 
         if rotation is not None:
             original_coords = np.array([x, y, 1])
@@ -626,7 +861,7 @@ class VLMNavAgent(Agent):
     def _generate_voxel(self, a_final: dict, zoom: int=9, agent_state: habitat_sim.AgentState=None, chosen_action: int=None):
         """For visualization purposes, add the agent's position and actions onto the voxel map"""
         agent_coords = self._global_to_grid(agent_state.position)
-        right = (agent_state.position[0] + zoom, 0, agent_state.position[2])
+        right = (agent_state.position[0] + zoom, agent_state.position[1], agent_state.position[2])
         right_coords = self._global_to_grid(right)
         delta = abs(agent_coords[0] - right_coords[0])
 
@@ -645,7 +880,7 @@ class VLMNavAgent(Agent):
             a_final[(0.75, np.pi)] = 0
 
         for (r, theta), action in a_final.items():
-            local_pt = np.array([r * np.sin(theta), 0, -r * np.cos(theta)])
+            local_pt = np.array([r * np.cos(theta), r * np.sin(theta), 0])
             global_pt = local_to_global(agent_state.position, agent_state.rotation, local_pt)
             act_coords = self._global_to_grid(global_pt, rotation=rotation_matrix)
 
@@ -678,13 +913,14 @@ class VLMNavAgent(Agent):
         zoomed_map = topdown_map[y1:y2, x1:x2]
         return zoomed_map
 
-    def _action_number_to_polar(self, action_number: int, a_final: list):
         """Converts the chosen action number to its PolarAction instance"""
+    def _action_number_to_polar(self, action_number: int, a_final: list):
         try:
             action_number = int(action_number)
             if action_number <= len(a_final) and action_number > 0:
                 r, theta = a_final[action_number - 1]
-                return PolarAction(r, -theta)
+                # return PolarAction(r, -theta)
+                return PolarAction(r, theta)
             if action_number == 0:
                 return PolarAction(0, np.pi)
         except ValueError:

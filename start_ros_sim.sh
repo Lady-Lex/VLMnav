@@ -51,12 +51,13 @@ trap cleanup SIGINT
 # -------- Launch terminal tasks --------
 gnome-terminal -- bash -c "roscore; exec bash" & get_new_pts
 gnome-terminal -- bash -c "roslaunch --wait arena_bringup start_arena.launch simulator:=gazebo model:=jackal map_file:=small_warehouse tm_obstacles:=scenario tm_robots:=scenario scenario_file:=default.json entity_manager:=pedsim; exec bash" & get_new_pts
-# gnome-terminal -- bash -c "roslaunch --wait tvss_nav start_arena_sfm.launch simulator:=gazebo model:=jackal map_file:=arena_hospital_small tm_obstacles:=scenario tm_robots:=scenario scenario_file:=v10.json entity_manager:=pedsim; exec bash" & get_new_pts
+# gnome-terminal -- bash -c "roslaunch --wait arena_bringup start_arena.launch simulator:=gazebo model:=jackal map_file:=arena_hospital_small tm_obstacles:=scenario tm_robots:=scenario scenario_file:=default.json entity_manager:=pedsim; exec bash" & get_new_pts
 gnome-terminal -- bash -c "roslaunch --wait rosbridge_server rosbridge_websocket.launch; exec bash" & get_new_pts
 gnome-terminal -- bash -c "roslaunch --wait teleop_twist_joy teleop.launch joy_config:=xbox joy_dev:=/dev/input/js0; exec bash" & get_new_pts   
 gnome-terminal -- bash -c "rosrun topic_tools relay /cmd_vel /jackal/cmd_vel; exec bash" & get_new_pts
+
 sleep 10
-gnome-terminal -- bash -c "source ~/anaconda3/etc/profile.d/conda.sh && conda activate vlm_nav && python src/vlm_nav_node.py; exec bash" & get_new_pts
+# gnome-terminal -- bash -c "source ~/anaconda3/etc/profile.d/conda.sh && conda activate vlm_nav && python src/vlm_nav_node.py; exec bash" & get_new_pts
 
 # -------- Exit handling --------
 

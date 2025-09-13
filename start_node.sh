@@ -1,0 +1,1 @@
+source ~/anaconda3/etc/profile.d/conda.sh && conda activate vlm_nav && python scripts/vlm_nav_node.py

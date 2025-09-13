@@ -1,0 +1,78 @@
+
+task: GOAT
+agent_cls: GOATAgent
+
+
+agent_cfg:
+  navigability_mode: 'depth_sensor' # Options: none | depth_estimate | segmentation | depth_sensor
+  project: true
+  pivot: false
+  context_history: 0
+  explore_bias: 4
+  max_action_dist: 5.0
+  min_action_dist: 3.0
+  clip_frac: 0.66
+  stopping_action_dist: 1.5
+  default_action: 0.2
+  spacing_ratio: 360
+  num_theta: 60
+  image_edge_threshold: 0.01
+  turn_around_cooldown: 10
+  navigability_height_threshold: 0.2
+  map_scale: 200
+  viz: true
+  # Termination condition threshold settings
+  min_steps_before_terminate: 3  # Minimum steps before termination
+  min_consecutive_stops: 1        # Minimum consecutive stop calls
+  max_avg_distance: 1.5          # Maximum average distance (meters)
+  max_min_distance: 1.0          # Maximum minimum distance (meters)
+  debug_timestamps: false        # Enable timestamp debugging output
+  sync_timestamps: true         # Enable timestamp synchronization
+  sync_timeout: 3             # Maximum wait time for sync (seconds)
+  sync_threshold: 0.1           # Maximum timestamp difference for sync (seconds)
+  sync_strategy: "wait_for_sync"   # "wait_for_sync" or "use_latest"
+  vlm_cfg:
+    model_cls: GeminiVLM
+    model_kwargs:
+      model: gemini-1.5-flash
+  agent_height: 0.9
+  agent_radius: 0.17
+  allow_slide: true
+  use_goal_image_agent: true
+  goal_image_agent_fov: 131
+  sensor_cfg:
+    height: 0.5
+    res_factor: 1
+    fov: 64
+    pitch: 0.0
+
+# sim_cfg:
+#   agent_height: 0.5
+#   agent_radius: 0.17
+#   allow_slide: true
+#   use_goal_image_agent: true
+#   goal_image_agent_fov: 131
+#   sensor_cfg:
+#     height: 0.5
+#     res_factor: 1
+#     fov: 64
+#     pitch: 0.0
+
+
+# —— Initial language goal (can also be overridden at runtime via topics) ——
+goal:
+  mode: description
+  # name: "Doctor"
+  # lang_desc: "Task1: Follow the doctor you see."
+
+  # name: "Front desk"
+  # lang_desc: "Task2: Go to the middle of the front desk."
+
+  # name: "Public circulation areas"
+  # lang_desc: "Task3: You are cruising in a hospital. Select waypoints ONLY in public circulation areas (corridors/hallways, lobbies, waiting areas). Treat all other areas as obstacles."
+
+  name: "Pallet jack"
+  lang_desc: "Task4: You are a delivery robot in a warehouse. Deliver the goods to the pallet jack."
+  
+  # name: "Pallet jack"
+  # lang_desc: "Task5: You are a delivery robot in a warehouse. Deliver the goods to the pallet jack. Treat all traffic cones as obstacles and do not enter the yellow striped restricted zones at any time."
